@@ -2,10 +2,29 @@ import { useState, useCallback, useRef } from 'react'
 
 const BACKEND = import.meta.env.VITE_BACKEND_URL || ''
 
+// Ping health endpoint until backend is awake (Render free tier cold start)
+async function warmupBackend(onStatus) {
+    const MAX_WAIT_MS = 60000
+    const INTERVAL_MS = 3000
+    const start = Date.now()
+    while (Date.now() - start < MAX_WAIT_MS) {
+        try {
+            const res = await fetch(`${BACKEND}/health`, { signal: AbortSignal.timeout(5000) })
+            if (res.ok) return true
+        } catch (_) { /* still sleeping */ }
+        const elapsed = Math.round((Date.now() - start) / 1000)
+        onStatus(`⏳ Backend waking up… ${elapsed}s (Render cold start, up to 60s)`)
+        await new Promise(r => setTimeout(r, INTERVAL_MS))
+    }
+    return false
+}
+
 export default function UploadZone({ onResult, onLoading, loading }) {
     const [drag, setDrag] = useState(false)
     const [file, setFile] = useState(null)
     const [error, setError] = useState('')
+    const [warmingUp, setWarmingUp] = useState(false)
+    const [warmupMsg, setWarmupMsg] = useState('')
     const inputRef = useRef(null)
 
     const handleFile = (f) => {
@@ -26,12 +45,30 @@ export default function UploadZone({ onResult, onLoading, loading }) {
 
     const onDragOver = (e) => { e.preventDefault(); setDrag(true) }
     const onDragLeave = () => setDrag(false)
-
     const openPicker = () => inputRef.current?.click()
 
     const analyze = async () => {
         if (!file) return
         setError('')
+        setWarmupMsg('')
+
+        // Step 1: Quick health check — if backend is sleeping, warm it up first
+        try {
+            await fetch(`${BACKEND}/health`, { signal: AbortSignal.timeout(4000) })
+        } catch (_) {
+            // Backend is sleeping — start warmup loop
+            setWarmingUp(true)
+            setWarmupMsg('⏳ Backend waking up… (Render cold start, up to 60s)')
+            const awake = await warmupBackend(setWarmupMsg)
+            setWarmingUp(false)
+            if (!awake) {
+                setError('Backend did not wake up in time. Please try again in a moment.')
+                return
+            }
+            setWarmupMsg('')
+        }
+
+        // Step 2: Send the video for analysis
         onLoading(true)
         try {
             const fd = new FormData()
@@ -45,15 +82,16 @@ export default function UploadZone({ onResult, onLoading, loading }) {
             data._backendUrl = BACKEND
             onResult(data)
         } catch (err) {
-            setError(err.message || 'Upload failed. Is the backend running?')
+            setError(err.message || 'Analysis failed. Please try again.')
         } finally {
             onLoading(false)
         }
     }
 
+    const busy = loading || warmingUp
+
     return (
         <div style={{ marginBottom: 28 }}>
-            {/* Hidden file input — triggered programmatically */}
             <input
                 ref={inputRef}
                 type="file"
@@ -62,17 +100,17 @@ export default function UploadZone({ onResult, onLoading, loading }) {
                 onChange={(e) => handleFile(e.target.files[0])}
             />
 
-            {/* Clickable drop zone — plain div, NOT a label */}
             <div
                 className={`upload-zone${drag ? ' drag-over' : ''}`}
-                onClick={openPicker}
+                onClick={!busy ? openPicker : undefined}
                 onDrop={onDrop}
                 onDragOver={onDragOver}
                 onDragLeave={onDragLeave}
                 role="button"
                 tabIndex={0}
-                onKeyDown={(e) => e.key === 'Enter' && openPicker()}
+                onKeyDown={(e) => e.key === 'Enter' && !busy && openPicker()}
                 aria-label="Click or drop a video file to upload"
+                style={{ cursor: busy ? 'default' : 'pointer' }}
             >
                 <span className="upload-icon">🎬</span>
                 {file ? (
@@ -89,18 +127,18 @@ export default function UploadZone({ onResult, onLoading, loading }) {
                 )}
             </div>
 
-            {/* Error message */}
             {error && (
                 <div className="error-box">
                     <span>⚠️</span> {error}
                 </div>
             )}
 
-            {/* Analyze button / progress — outside the drop zone div */}
             {file && (
-                loading ? (
+                busy ? (
                     <div className="progress-wrap">
-                        <p className="progress-label">🔍 Analyzing frames with optical flow…</p>
+                        <p className="progress-label">
+                            {warmingUp ? warmupMsg : '🔍 Analyzing frames with optical flow…'}
+                        </p>
                         <div className="progress-bar"><div className="progress-fill" /></div>
                     </div>
                 ) : (
